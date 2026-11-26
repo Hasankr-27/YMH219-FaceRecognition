@@ -6,8 +6,14 @@ namespace YMH219_FaceRecognition
     public partial class Form1 : Form
     {
         private FaceDetector? detector;
+        private readonly FaceRecognizerService recognizer = new FaceRecognizerService();
         private readonly CameraService camera = new CameraService();
-        private int busy = 0;   // önceki kare hâlâ işleniyorsa yenisini atlamak için
+        private int busy = 0;
+
+        // Örnek kaydetmek için son kare ve içindeki yüzler
+        private readonly object frameLock = new object();
+        private Mat? lastFrame;
+        private Rect[] lastFaces = Array.Empty<Rect>();
 
         private readonly Label lblStatus;
         private readonly PictureBox picture;
@@ -15,13 +21,17 @@ namespace YMH219_FaceRecognition
         private readonly Button btnStop;
         private readonly Button btnOpen;
         private readonly Label lblInfo;
+        private readonly TextBox txtLabel;
+        private readonly Button btnSample;
+        private readonly Button btnTrain;
+        private readonly Label lblTrain;
 
         public Form1()
         {
             InitializeComponent();
 
             Text = "Yüz Algılama ve Tanıma";
-            ClientSize = new System.Drawing.Size(760, 600);
+            ClientSize = new System.Drawing.Size(760, 680);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             Font = new Font("Segoe UI", 10);
@@ -45,22 +55,39 @@ namespace YMH219_FaceRecognition
                 BackColor = Color.Black
             };
 
-            btnStart = CreateButton("📷 Kamera Başlat", 20);
-            btnStop = CreateButton("Kamera Durdur", 200);
-            btnOpen = CreateButton("🖼 Görüntü Seç", 380);
+            // 1. satır: kamera ve resim
+            btnStart = CreateButton("📷 Kamera Başlat", 20, 530);
+            btnStop = CreateButton("Kamera Durdur", 200, 530);
+            btnOpen = CreateButton("🖼 Görüntü Seç", 380, 530);
 
             lblInfo = new Label
             {
                 Text = "Algılanan yüz: -",
-                AutoSize = true,
-                Location = new System.Drawing.Point(570, 542)
+                AutoSize = false,
+                Location = new System.Drawing.Point(560, 522),
+                Size = new System.Drawing.Size(190, 66),
+                TextAlign = ContentAlignment.MiddleLeft
             };
 
-            Controls.AddRange(new Control[] { lblStatus, picture, btnStart, btnStop, btnOpen, lblInfo });
+            // 2. satır: örnek kaydetme ve eğitim
+            var lblName = new Label { Text = "İsim:", AutoSize = true, Location = new System.Drawing.Point(20, 600) };
+            txtLabel = new TextBox { Location = new System.Drawing.Point(70, 597), Width = 120 };
+            btnSample = CreateButton("Örnek Kaydet (20)", 200, 590);
+            btnTrain = CreateButton("Eğit", 380, 590);
+
+            lblTrain = new Label { AutoSize = true, Location = new System.Drawing.Point(20, 645) };
+
+            Controls.AddRange(new Control[]
+            {
+                lblStatus, picture, btnStart, btnStop, btnOpen, lblInfo,
+                lblName, txtLabel, btnSample, btnTrain, lblTrain
+            });
 
             btnStart.Click += (s, e) => StartCamera();
             btnStop.Click += async (s, e) => { await camera.StopAsync(); UpdateUi(); };
             btnOpen.Click += async (s, e) => await OpenImageAsync();
+            btnSample.Click += async (s, e) => await CaptureSamplesAsync();
+            btnTrain.Click += (s, e) => TrainModel();
 
             camera.FrameCaptured += OnFrameCaptured;
             camera.ErrorOccurred += message => RunOnUi(() =>
@@ -72,15 +99,17 @@ namespace YMH219_FaceRecognition
             FormClosing += (s, e) => _ = camera.StopAsync();
 
             InitDetector();
+            AutoTrainOnStartup();
             UpdateUi();
+            UpdateTrainInfo();
         }
 
-        private Button CreateButton(string text, int x)
+        private Button CreateButton(string text, int x, int y)
         {
             return new Button
             {
                 Text = text,
-                Location = new System.Drawing.Point(x, 530),
+                Location = new System.Drawing.Point(x, y),
                 Size = new System.Drawing.Size(170, 45)
             };
         }
@@ -97,8 +126,23 @@ namespace YMH219_FaceRecognition
             }
         }
 
+        // Daha önce kaydedilmiş örnekler varsa açılışta otomatik eğit
+        private void AutoTrainOnStartup()
+        {
+            try
+            {
+                if (recognizer.GetLabels().Count >= 2)
+                    recognizer.Train();
+            }
+            catch
+            {
+                // açılışta eğitilemezse sorun değil, kullanıcı Eğit'e basabilir
+            }
+        }
+
         private void StartCamera()
         {
+            busy = 0;
             try
             {
                 camera.Start();
@@ -110,20 +154,22 @@ namespace YMH219_FaceRecognition
             UpdateUi();
         }
 
-        // Kameradan gelen her kare (arka plan iş parçacığında çalışır)
+        // Kameradan gelen her kare (arka plan iş parçacığında)
         private void OnFrameCaptured(Mat frame)
         {
             if (Interlocked.Exchange(ref busy, 1) == 1)
             {
-                frame.Dispose();   // önceki kare hâlâ ekrana basılıyor, bunu atla
+                frame.Dispose();
                 return;
             }
 
             Bitmap bitmap;
-            int faceCount;
+            string summary;
             try
             {
-                faceCount = ProcessImage(frame);
+                Rect[] faces = detector!.Detect(frame);
+                RememberFrame(frame, faces);
+                summary = DrawResults(frame, faces);
                 bitmap = frame.ToBitmap();
             }
             finally
@@ -133,7 +179,7 @@ namespace YMH219_FaceRecognition
 
             RunOnUi(() =>
             {
-                ShowImage(bitmap, faceCount);
+                ShowImage(bitmap, summary);
                 busy = 0;
             });
         }
@@ -152,20 +198,21 @@ namespace YMH219_FaceRecognition
                 Filter = "Resim dosyaları|*.jpg;*.jpeg;*.png;*.bmp"
             };
 
-            if (dialog.ShowDialog() != DialogResult.OK)
+            if (dialog.ShowDialog() != DialogResult.OK || detector == null)
                 return;
 
             try
             {
-                // Türkçe karakterli yollarda sorun çıkmasın diye dosyayı byte olarak okuyoruz
                 byte[] bytes = File.ReadAllBytes(dialog.FileName);
                 using Mat image = Cv2.ImDecode(bytes, ImreadModes.Color);
 
                 if (image.Empty())
                     throw new InvalidDataException("Seçilen dosya geçerli bir resim değil.");
 
-                int faceCount = ProcessImage(image);
-                ShowImage(image.ToBitmap(), faceCount);
+                Rect[] faces = detector.Detect(image);
+                RememberFrame(image, faces);
+                string summary = DrawResults(image, faces);
+                ShowImage(image.ToBitmap(), summary);
             }
             catch (Exception ex)
             {
@@ -174,25 +221,168 @@ namespace YMH219_FaceRecognition
             }
         }
 
-        // Yüzleri bulur, etraflarına dikdörtgen çizer, yüz sayısını döndürür
-        private int ProcessImage(Mat image)
+        // Örnek kaydetmek için kareyi (dikdörtgenler çizilmeden önce) sakla
+        private void RememberFrame(Mat image, Rect[] faces)
         {
-            if (detector == null) return 0;
-
-            Rect[] faces = detector.Detect(image);
-            foreach (var face in faces)
-                Cv2.Rectangle(image, face, new Scalar(0, 255, 0), 3);   // yeşil (BGR)
-
-            return faces.Length;
+            lock (frameLock)
+            {
+                lastFrame?.Dispose();
+                lastFrame = image.Clone();
+                lastFaces = faces;
+            }
         }
 
-        private void ShowImage(Bitmap bitmap, int faceCount)
+        // Yüzleri tanır, dikdörtgen + isim çizer, bilgi metnini döndürür
+        private string DrawResults(Mat image, Rect[] faces)
+        {
+            // Önce tahmin et (çizimler yüzü bozmasın), sonra çiz
+            var results = new List<(Rect Face, string Label, double Confidence)>();
+            foreach (Rect face in faces)
+            {
+                if (recognizer.IsTrained)
+                {
+                    var (label, confidence) = recognizer.Predict(image, face);
+                    results.Add((face, label, confidence));
+                }
+                else
+                {
+                    results.Add((face, "", 0));
+                }
+            }
+
+            foreach (var r in results)
+            {
+                bool unknown = r.Label == "Bilinmiyor";
+                Scalar color = unknown ? new Scalar(0, 0, 255) : new Scalar(0, 255, 0);   // kırmızı / yeşil (BGR)
+
+                Cv2.Rectangle(image, r.Face, color, 3);
+
+                if (r.Label != "")
+                {
+                    string text = $"{ToAscii(r.Label)} %{r.Confidence:0}";
+                    int y = Math.Max(r.Face.Y - 10, 25);
+                    Cv2.PutText(image, text, new OpenCvSharp.Point(r.Face.X, y),
+                                HersheyFonts.HersheySimplex, 0.8, color, 2);
+                }
+            }
+
+            if (faces.Length == 0)
+                return "Yüz algılanmadı";
+            if (!recognizer.IsTrained)
+                return $"Algılanan yüz: {faces.Length}\n(Tanıma için önce eğitin)";
+
+            var first = results[0];
+            return $"Algılanan yüz: {faces.Length}\nTahmin: {first.Label}\nGüven: %{first.Confidence:0}";
+        }
+
+        // OpenCV yazı fonksiyonu Türkçe karakter desteklemiyor
+        private static string ToAscii(string text)
+        {
+            return text.Replace('ç', 'c').Replace('ğ', 'g').Replace('ı', 'i').Replace('ö', 'o')
+                       .Replace('ş', 's').Replace('ü', 'u').Replace('Ç', 'C').Replace('Ğ', 'G')
+                       .Replace('İ', 'I').Replace('Ö', 'O').Replace('Ş', 'S').Replace('Ü', 'U');
+        }
+
+        // Kameradan 20 örnek kaydeder (fotoğraftaysa 1 örnek)
+        private async Task CaptureSamplesAsync()
+        {
+            string label = txtLabel.Text.Trim();
+            if (label == "")
+            {
+                MessageBox.Show("Lütfen önce bir isim girin.", "Uyarı",
+                                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            btnSample.Enabled = false;
+            int saved = 0;
+
+            try
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    Mat? frame;
+                    Rect[] faces;
+                    lock (frameLock)
+                    {
+                        frame = lastFrame?.Clone();
+                        faces = lastFaces;
+                    }
+
+                    if (frame != null)
+                    {
+                        using (frame)
+                        {
+                            if (faces.Length == 1)   // tek yüz varsa kaydet, karışmasın
+                            {
+                                recognizer.AddSample(frame, faces[0], label);
+                                saved++;
+                            }
+                        }
+                    }
+
+                    lblTrain.Text = $"Kaydediliyor... {saved}/20 (başını hafifçe oynat)";
+
+                    if (!camera.IsRunning) break;   // fotoğraftan tek örnek yeter
+                    await Task.Delay(150);
+                }
+            }
+            catch (Exception ex) when (ex is ArgumentException || ex is IOException || ex is UnauthorizedAccessException)
+            {
+                MessageBox.Show(ex.Message, "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                btnSample.Enabled = true;
+            }
+
+            if (saved == 0)
+                MessageBox.Show("Örnek kaydedilemedi. Görüntüde tam olarak 1 yüz olmalı.", "Uyarı",
+                                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+            UpdateTrainInfo();
+        }
+
+        private void TrainModel()
+        {
+            try
+            {
+                recognizer.Train();
+                UpdateTrainInfo();
+                MessageBox.Show("Model eğitildi. Artık yüzler tanınacak.", "Eğitim Tamamlandı",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (InvalidOperationException ex)
+            {
+                MessageBox.Show(ex.Message, "Uyarı", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Eğitim sırasında hata oluştu:\n" + ex.Message, "Hata",
+                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void UpdateTrainInfo()
+        {
+            var labels = recognizer.GetLabels();
+            if (labels.Count == 0)
+            {
+                lblTrain.Text = "Henüz örnek yok. Bir isim yazıp 'Örnek Kaydet'e basın.";
+                return;
+            }
+
+            string list = string.Join(",  ", labels.Select(l => $"{l}: {recognizer.GetSampleCount(l)} örnek"));
+            lblTrain.Text = list + (recognizer.IsTrained ? "   ✓ eğitildi" : "   (henüz eğitilmedi)");
+        }
+
+        private void ShowImage(Bitmap bitmap, string summary)
         {
             var old = picture.Image;
             picture.Image = bitmap;
-            old?.Dispose();   // eski görüntünün belleğini serbest bırak
+            old?.Dispose();
 
-            lblInfo.Text = $"Algılanan yüz: {faceCount}";
+            lblInfo.Text = summary;
         }
 
         private void UpdateUi()
@@ -220,7 +410,6 @@ namespace YMH219_FaceRecognition
             }
             catch (InvalidOperationException)
             {
-                // pencere kapanırken gelen son kareler, yok say
             }
         }
     }
